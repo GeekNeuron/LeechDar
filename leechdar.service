@@ -1,0 +1,25 @@
+[Unit]
+Description=LeechDar — Telegram torrent leech bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# کاربر غیر-روت که پوشه‌ی پروژه رو مالکه؛ عوضش کن با یوزر خودت
+User=leechdar
+WorkingDirectory=/opt/leechdar
+EnvironmentFile=/opt/leechdar/.env
+ExecStart=/opt/leechdar/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+# جلوگیری از خوردن کل رم سرور در صورت باگ حافظه
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
+
+# نصب:
+#   sudo cp leechdar.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now leechdar
+#   journalctl -u leechdar -f     # مشاهده لاگ زنده

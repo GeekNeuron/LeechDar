@@ -1,0 +1,63 @@
+version: "3.8"
+
+services:
+  qbittorrent:
+    image: linuxserver/qbittorrent:latest
+    container_name: leechdar-qbittorrent
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Asia/Tehran}
+      - WEBUI_PORT=8080
+    volumes:
+      - ./qbittorrent-config:/config
+      # این مسیر باید عیناً همون مسیری باشه که سرویس bot هم مونت می‌کنه،
+      # چون ربات مسیر فایل رو مستقیم از qBittorrent می‌گیره و باید
+      # از داخل کانتینر خودش هم به همون فایل دسترسی داشته باشه.
+      - downloads:/downloads
+    ports:
+      - "8080:8080"     # وب‌یوآی qBittorrent
+      - "6881:6881"     # پورت تورنت (TCP)
+      - "6881:6881/udp" # پورت تورنت (UDP)
+    restart: unless-stopped
+
+  bot:
+    build: .
+    container_name: leechdar-bot
+    depends_on:
+      - qbittorrent
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
+      - QB_HOST=qbittorrent
+      - QB_PORT=8080
+      - QB_USERNAME=${QB_USERNAME}
+      - QB_PASSWORD=${QB_PASSWORD}
+      - TELEGRAM_UPLOAD_MODE=${TELEGRAM_UPLOAD_MODE:-bot_api}
+      - TELEGRAM_IS_PREMIUM=${TELEGRAM_IS_PREMIUM:-false}
+      - PYROGRAM_API_ID=${PYROGRAM_API_ID:-0}
+      - PYROGRAM_API_HASH=${PYROGRAM_API_HASH:-}
+      - PYROGRAM_SESSION_STRING=${PYROGRAM_SESSION_STRING:-}
+      - SPLIT_SIZE_MB=${SPLIT_SIZE_MB:-}
+      - AUTO_ZIP_MULTI_FILE_TORRENTS=${AUTO_ZIP_MULTI_FILE_TORRENTS:-true}
+      - DELETE_AFTER_UPLOAD=${DELETE_AFTER_UPLOAD:-false}
+      - GDRIVE_ENABLED=${GDRIVE_ENABLED:-false}
+      - GDRIVE_FOLDER_ID=${GDRIVE_FOLDER_ID:-}
+      - RCLONE_ENABLED=${RCLONE_ENABLED:-false}
+      - RCLONE_REMOTE=${RCLONE_REMOTE:-}
+      - ARIA2_SECRET=${ARIA2_SECRET:-leechdar-secret-change-me}
+      - ARIA2_DOWNLOAD_DIR=/downloads/aria2
+      - WEBUI_ENABLED=${WEBUI_ENABLED:-false}
+      - WEBUI_HOST=0.0.0.0
+      - WEBUI_PORT=8090
+      - WEBUI_PASSWORD=${WEBUI_PASSWORD:-change-me-please}
+    ports:
+      - "8090:8090"   # داشبورد وب (فقط اگه WEBUI_ENABLED=true باشه)
+    volumes:
+      - downloads:/downloads
+      - ./gdrive-data:/app/gdrive-data   # credentials.json و توکن گوگل‌درایو اینجا
+      - ./rclone-config:/root/.config/rclone   # rclone.conf از سیستم خودتون اینجا کپی می‌شه
+    restart: unless-stopped
+
+volumes:
+  downloads:
