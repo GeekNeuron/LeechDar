@@ -29,6 +29,7 @@ from telegram.ext import (
     ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     TypeHandler,
     filters,
@@ -40,6 +41,7 @@ import content_sniff
 import db
 import downloader_mega
 import downloader_ytdlp
+import ffmpeg_tools
 import jdownloader_client
 import uploader_gofile
 import uploader_pixeldrain
@@ -155,8 +157,19 @@ def _persist(h: str, item: dict) -> None:
     )
 
 
+def get_qb_settings() -> dict:
+    """تنظیمات qBittorrent — اول دیتابیس (از /setup) رو چک می‌کنه، بعد config.py/env رو."""
+    return {
+        "host": db.get_setting("qb_host") or config.QB_HOST,
+        "port": int(db.get_setting("qb_port") or config.QB_PORT),
+        "username": db.get_setting("qb_username") or config.QB_USERNAME,
+        "password": db.get_setting("qb_password") or config.QB_PASSWORD,
+    }
+
+
 def qb() -> object:
-    return qbit_client.get_client(config.QB_HOST, config.QB_PORT, config.QB_USERNAME, config.QB_PASSWORD)
+    s = get_qb_settings()
+    return qbit_client.get_client(s["host"], s["port"], s["username"], s["password"])
 
 
 _aria2_api = None
@@ -187,7 +200,30 @@ def looks_like_direct_file(url: str) -> bool:
 
 
 def is_allowed(user_id: int) -> bool:
-    return not config.ALLOWED_USER_IDS or user_id in config.ALLOWED_USER_IDS
+    if config.ALLOWED_USER_IDS and user_id in config.ALLOWED_USER_IDS:
+        return True
+    return db.is_user_allowed(user_id)
+
+
+def is_owner(user_id: int) -> bool:
+    if config.ALLOWED_USER_IDS and db.count_allowed_users() == 0:
+        return user_id in config.ALLOWED_USER_IDS  # تنظیم‌شده با config، همه معادل مالک
+    return db.is_user_owner(user_id)
+
+
+def try_auto_claim(user_id: int) -> bool:
+    """
+    اگه هیچ‌کس هنوز صاحب ربات نشده (نه تو config، نه تو دیتابیس)،
+    اولین کسی که پیام بده خودکار مالک می‌شه — برای کلون‌وران بدون
+    نیاز به دونستن آیدی تلگرام از قبل.
+    """
+    if config.ALLOWED_USER_IDS:
+        return False  # صاحب از قبل تو config مشخص شده
+    if db.count_allowed_users() > 0:
+        return False  # یکی دیگه قبلاً claim کرده
+    db.add_allowed_user(user_id, is_owner=True)
+    log.info("کاربر %s به‌عنوان مالک (اولین claim) ثبت شد", user_id)
+    return True
 
 
 def current_cap_mb(user_id: int) -> int:
@@ -254,19 +290,28 @@ def promote_queued(client, app: Application) -> None:
 # ------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    setup_notice = ""
+    try:
+        await asyncio.to_thread(qb)
+    except Exception:
+        setup_notice = "⚠️ qBittorrent هنوز وصل نیست — اول /setup رو بزن تا اتصالش رو تنظیم کنی.\n\n"
+
     await update.message.reply_text(
-        "سلام! لینک مگنت، فایل .torrent، لینک مستقیم/یوتیوب/هر سایت دیگه بفرست "
+        setup_notice + "سلام! لینک مگنت، فایل .torrent، لینک مستقیم/یوتیوب/هر سایت دیگه بفرست "
         "— خودم تشخیص می‌دم (حتی بدون پسوند مشخص). یه فایل معمولی (غیر-تورنت) "
         "بفرستی، ازش برات تورنت می‌سازم و سیدش می‌کنم.\n\n"
+        "راه‌اندازی اولیه: /setup (تنظیم اتصال qBittorrent)\n"
         "مدیریت: /status /pause /resume /cancel /cancelconfirm <hash8>\n"
         "تنظیمات: /destination /uploadmode /premium /splitsize /splitparts /tozip "
         "/zippassword /seedlimit\n"
         "فایل: /files <hash8> — /selectfiles <hash8> <1,2,3>\n"
+        "ویرایش ویدیو/صدا: /convert /trim /watermark /thumbnail /extractaudio\n"
         "RSS: /rssadd /rsslist /rssremove /rssrule /rssrules /rssruledel\n"
         "داشبورد تو خود تلگرام: /webapp\n"
         "جستجو: /search <عبارت> — /searchadd <شماره>\n"
         "بک‌آپ: /backup — /restore (با ریپلای رو فایل بک‌آپ)\n"
-        "ابزار: /extract /rename /mergezip /upload /forceadd /ytdl /leech /log\n"
+        "مدیریت کاربران (فقط مالک): /adduser /removeuser /listusers\n"
+        "ابزار: /extract /rename /mergezip /upload /forceadd /ytdl /leech /mega /jdadd /log /update\n"
     )
 
 
@@ -492,6 +537,115 @@ async def cmd_rename(update, context):
     item["files"][0] = new_path
     _persist(h, item)
     await update.message.reply_text(f"تغییر نام شد به: {new_path.name}")
+
+
+def _get_pending_file(short_hash: str):
+    """فایل اول یه تسک pending رو برمی‌گردونه، یا None اگه پیدا نشد."""
+    h = _full_hash(short_hash)
+    item = pending.get(h)
+    if not item or not item["files"]:
+        return None, None, None
+    return h, item, item["files"][0]
+
+
+async def cmd_convert(update, context):
+    if not ffmpeg_tools.is_available():
+        return await update.message.reply_text("ffmpeg رو سیستم نصب نیست.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("استفاده: /convert <hash8> <پسوند مقصد، مثل mp4>")
+    h, item, src = _get_pending_file(context.args[0])
+    if not src:
+        return await update.message.reply_text("این تورنت آماده نیست.")
+    ext = context.args[1].lstrip(".")
+    out = WORK_DIR / "ffmpeg" / f"{src.stem}.{ext}"
+    await update.message.reply_text(f"🎬 در حال تبدیل به .{ext}...")
+    try:
+        new_path = await ffmpeg_tools.convert_format(src, out)
+    except Exception as e:
+        return await update.message.reply_text(f"❌ خطا: {e}")
+    item["files"][0] = new_path
+    _persist(h, item)
+    await update.message.reply_text(f"✅ تبدیل شد: {new_path.name}")
+
+
+async def cmd_trim(update, context):
+    if not ffmpeg_tools.is_available():
+        return await update.message.reply_text("ffmpeg رو سیستم نصب نیست.")
+    if len(context.args) < 3:
+        return await update.message.reply_text("استفاده: /trim <hash8> <شروع_ثانیه> <مدت_ثانیه>")
+    h, item, src = _get_pending_file(context.args[0])
+    if not src:
+        return await update.message.reply_text("این تورنت آماده نیست.")
+    try:
+        start, duration = float(context.args[1]), float(context.args[2])
+    except ValueError:
+        return await update.message.reply_text("شروع و مدت باید عدد باشن (ثانیه).")
+    out = WORK_DIR / "ffmpeg" / f"{src.stem}_trim{src.suffix}"
+    await update.message.reply_text(f"✂️ در حال برش از ثانیه {start} به مدت {duration}...")
+    try:
+        new_path = await ffmpeg_tools.trim(src, out, start, duration)
+    except Exception as e:
+        return await update.message.reply_text(f"❌ خطا: {e}")
+    item["files"][0] = new_path
+    _persist(h, item)
+    await update.message.reply_text(f"✅ برش انجام شد: {new_path.name}")
+
+
+async def cmd_watermark(update, context):
+    if not ffmpeg_tools.is_available():
+        return await update.message.reply_text("ffmpeg رو سیستم نصب نیست.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("استفاده: /watermark <hash8> <متن>")
+    h, item, src = _get_pending_file(context.args[0])
+    if not src:
+        return await update.message.reply_text("این تورنت آماده نیست.")
+    text = " ".join(context.args[1:])
+    out = WORK_DIR / "ffmpeg" / f"{src.stem}_wm{src.suffix}"
+    await update.message.reply_text("🖊 در حال اضافه‌کردن واترمارک...")
+    try:
+        new_path = await ffmpeg_tools.add_text_watermark(src, out, text)
+    except Exception as e:
+        return await update.message.reply_text(f"❌ خطا: {e}")
+    item["files"][0] = new_path
+    _persist(h, item)
+    await update.message.reply_text(f"✅ واترمارک اضافه شد: {new_path.name}")
+
+
+async def cmd_thumbnail(update, context):
+    if not ffmpeg_tools.is_available():
+        return await update.message.reply_text("ffmpeg رو سیستم نصب نیست.")
+    if not context.args:
+        return await update.message.reply_text("استفاده: /thumbnail <hash8> [ثانیه، پیش‌فرض ۳]")
+    h, item, src = _get_pending_file(context.args[0])
+    if not src:
+        return await update.message.reply_text("این تورنت آماده نیست.")
+    ts = float(context.args[1]) if len(context.args) > 1 else 3.0
+    out = WORK_DIR / "ffmpeg" / f"{src.stem}_thumb.jpg"
+    try:
+        thumb_path = await ffmpeg_tools.generate_thumbnail(src, out, ts)
+    except Exception as e:
+        return await update.message.reply_text(f"❌ خطا: {e}")
+    with open(thumb_path, "rb") as f:
+        await context.bot.send_photo(update.effective_chat.id, photo=f)
+
+
+async def cmd_extractaudio(update, context):
+    if not ffmpeg_tools.is_available():
+        return await update.message.reply_text("ffmpeg رو سیستم نصب نیست.")
+    if not context.args:
+        return await update.message.reply_text("استفاده: /extractaudio <hash8>")
+    h, item, src = _get_pending_file(context.args[0])
+    if not src:
+        return await update.message.reply_text("این تورنت آماده نیست.")
+    out = WORK_DIR / "ffmpeg" / f"{src.stem}.mp3"
+    await update.message.reply_text("🎵 در حال استخراج صدا...")
+    try:
+        new_path = await ffmpeg_tools.extract_audio(src, out)
+    except Exception as e:
+        return await update.message.reply_text(f"❌ خطا: {e}")
+    item["files"][0] = new_path
+    _persist(h, item)
+    await update.message.reply_text(f"✅ صدا استخراج شد: {new_path.name}")
 
 
 async def cmd_extract(update, context):
@@ -849,6 +1003,118 @@ async def cmd_update(update, context):
     )
     log.info("آپدیت از git pull گرفته شد؛ در حال ری‌استارت فرآیند...")
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+SETUP_HOST, SETUP_PORT, SETUP_USERNAME, SETUP_PASSWORD = range(4)
+
+
+async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    current = get_qb_settings()
+    await update.message.reply_text(
+        "⚙️ راه‌اندازی اتصال qBittorrent — بدون این، دانلود تورنت کار نمی‌کنه "
+        "(بقیه‌ی امکانات مثل yt-dlp/aria2 نیاز به این مرحله ندارن).\n\n"
+        "تو هر مرحله یا مقدار جدید رو بفرست، یا /skip بزن تا همون مقدار فعلی بمونه. "
+        "هر وقت خواستی با /cancel کامل لغو کن.\n\n"
+        f"هاست فعلی: {current['host']}\nهاست جدید qBittorrent رو بفرست (مثلاً localhost):"
+    )
+    return SETUP_HOST
+
+
+async def setup_host(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text != "/skip":
+        context.user_data["qb_host"] = text
+    current = get_qb_settings()
+    await update.message.reply_text(f"پورت فعلی: {current['port']}\nپورت جدید؟ (یا /skip)")
+    return SETUP_PORT
+
+
+async def setup_port(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text != "/skip":
+        try:
+            int(text)
+        except ValueError:
+            await update.message.reply_text("پورت باید فقط عدد باشه. دوباره بفرست یا /skip بزن.")
+            return SETUP_PORT
+        context.user_data["qb_port"] = text
+    current = get_qb_settings()
+    await update.message.reply_text(f"یوزرنیم فعلی: {current['username']}\nیوزرنیم جدید؟ (یا /skip)")
+    return SETUP_USERNAME
+
+
+async def setup_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text != "/skip":
+        context.user_data["qb_username"] = text
+    await update.message.reply_text("پسورد جدید؟ (یا /skip — پسورد قبلی دست‌نخورده می‌مونه)")
+    return SETUP_PASSWORD
+
+
+async def setup_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text != "/skip":
+        context.user_data["qb_password"] = text
+
+    for key, value in context.user_data.items():
+        db.set_setting(key, value)  # تنظیمات سراسری (user_id=0 پیش‌فرض)
+
+    await update.message.reply_text("🔌 در حال تست اتصال با مقادیر جدید...")
+    try:
+        await asyncio.to_thread(qb)
+        await update.message.reply_text("✅ تنظیمات ذخیره شد و اتصال به qBittorrent موفق بود. آماده‌ای!")
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠️ تنظیمات ذخیره شد ولی الان نتونستم وصل بشم: {e}\n"
+            "مطمئن شو qBittorrent روشنه و Web UI فعاله، بعد دوباره /setup بزن."
+        )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("لغو شد؛ چیزی تغییر نکرد.")
+    return ConversationHandler.END
+
+
+async def cmd_adduser(update, context):
+    if not is_owner(update.effective_user.id):
+        return await update.message.reply_text("فقط مالک ربات می‌تونه کاربر اضافه کنه.")
+    if not context.args:
+        return await update.message.reply_text("استفاده: /adduser <آیدی عددی تلگرام>")
+    try:
+        new_id = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("آیدی باید عدد باشه (از @userinfobot بگیرش).")
+    db.add_allowed_user(new_id)
+    await update.message.reply_text(f"✅ کاربر {new_id} اضافه شد.")
+
+
+async def cmd_removeuser(update, context):
+    if not is_owner(update.effective_user.id):
+        return await update.message.reply_text("فقط مالک ربات می‌تونه کاربر حذف کنه.")
+    if not context.args:
+        return await update.message.reply_text("استفاده: /removeuser <آیدی عددی تلگرام>")
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("آیدی باید عدد باشه.")
+    if target_id == update.effective_user.id:
+        return await update.message.reply_text("نمی‌تونی خودت رو حذف کنی.")
+    db.remove_allowed_user(target_id)
+    await update.message.reply_text(f"🗑 کاربر {target_id} حذف شد.")
+
+
+async def cmd_listusers(update, context):
+    if not is_owner(update.effective_user.id):
+        return await update.message.reply_text("فقط مالک ربات می‌تونه این لیست رو ببینه.")
+    users = db.list_allowed_users()
+    config_ids = config.ALLOWED_USER_IDS - {u["user_id"] for u in users}
+    lines = [f"• {u['user_id']}{' (مالک)' if u['is_owner'] else ''}" for u in users]
+    lines += [f"• {uid} (از config.py)" for uid in config_ids]
+    await update.message.reply_text("\n".join(lines) if lines else "هیچ کاربری ثبت نشده.")
 
 
 async def cmd_log(update, context):
@@ -1634,15 +1900,21 @@ async def notify_fallback(message: str, title: str = "LeechDar") -> None:
 
 
 def health_check() -> None:
-    """قبل از بالا اومدن ربات، اتصال qBittorrent رو چک می‌کنه تا خطای واضح بده نه کرش مبهم."""
+    """
+    قبل از بالا اومدن ربات، اتصال qBittorrent رو چک می‌کنه. اگه وصل
+    نشد، فقط هشدار می‌ده و ربات رو می‌ذاره بالا بیاد (sys.exit نمی‌کنه) —
+    چون ممکنه کاربر هنوز /setup رو نزده باشه؛ باید بتونه با تلگرام
+    وصل بشه و از همونجا تنظیمش کنه.
+    """
     try:
         qb()
+        log.info("health-check: qBittorrent در دسترسه.")
     except Exception as e:
-        log.critical("اتصال به qBittorrent برقرار نشد (%s). QB_HOST/QB_PORT/QB_USERNAME/QB_PASSWORD رو چک کن.", e)
-        if config.NTFY_ENABLED and config.NTFY_URL:
-            asyncio.run(notifier.send_ntfy(config.NTFY_URL, f"LeechDar بالا نیومد: اتصال qBittorrent شکست خورد ({e})"))
-        sys.exit(1)
-    log.info("health-check قبول شد: qBittorrent در دسترسه.")
+        log.warning(
+            "اتصال اولیه به qBittorrent برقرار نشد (%s). ربات بالا میاد ولی دانلود تورنت کار "
+            "نمی‌کنه تا با دستور /setup (تو خود تلگرام) تنظیمش کنی.",
+            e,
+        )
 
     try:
         get_aria2_api()
@@ -1660,6 +1932,8 @@ async def _global_auth_check(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """
     user = update.effective_user
     if user and not is_allowed(user.id):
+        if try_auto_claim(user.id):
+            return  # همین الان مالک شد، اجازه بده ادامه بده
         if update.message:
             await update.message.reply_text("دسترسی نداری.")
         raise ApplicationHandlerStop
@@ -1669,6 +1943,21 @@ def main() -> None:
     health_check()
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(TypeHandler(Update, _global_auth_check), group=-1)
+
+    setup_conv = ConversationHandler(
+        entry_points=[CommandHandler("setup", setup_start)],
+        states={
+            SETUP_HOST: [MessageHandler(filters.TEXT, setup_host)],
+            SETUP_PORT: [MessageHandler(filters.TEXT, setup_port)],
+            SETUP_USERNAME: [MessageHandler(filters.TEXT, setup_username)],
+            SETUP_PASSWORD: [MessageHandler(filters.TEXT, setup_password)],
+        },
+        fallbacks=[CommandHandler("cancel", setup_cancel)],
+    )
+    app.add_handler(setup_conv)
+    app.add_handler(CommandHandler("adduser", cmd_adduser))
+    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
+    app.add_handler(CommandHandler("listusers", cmd_listusers))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("pause", cmd_pause))
@@ -1684,6 +1973,11 @@ def main() -> None:
     app.add_handler(CommandHandler("splitparts", cmd_splitparts))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("extract", cmd_extract))
+    app.add_handler(CommandHandler("convert", cmd_convert))
+    app.add_handler(CommandHandler("trim", cmd_trim))
+    app.add_handler(CommandHandler("watermark", cmd_watermark))
+    app.add_handler(CommandHandler("thumbnail", cmd_thumbnail))
+    app.add_handler(CommandHandler("extractaudio", cmd_extractaudio))
     app.add_handler(CommandHandler("mergezip", cmd_mergezip))
     app.add_handler(CommandHandler("upload", cmd_upload))
     app.add_handler(CommandHandler("files", cmd_files))

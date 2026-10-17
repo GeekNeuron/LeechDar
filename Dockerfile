@@ -1,10 +1,13 @@
 FROM python:3.12-slim
 
-# unrar-free برای استخراج rar، curl برای نصب rclone، aria2 برای لینک مستقیم
+# unrar-free برای استخراج rar، curl برای نصب rclone، aria2 برای لینک
+# مستقیم، ffmpeg برای ویرایش ویدیو/صدا، git برای /update
 RUN apt-get update && apt-get install -y --no-install-recommends \
     unrar-free \
     curl \
     aria2 \
+    ffmpeg \
+    git \
     && curl https://rclone.org/install.sh | bash \
     && rm -rf /var/lib/apt/lists/*
 

@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS completed (
     torrent_name TEXT,
     finished_at REAL
 );
+
+CREATE TABLE IF NOT EXISTS allowed_users (
+    user_id INTEGER PRIMARY KEY,
+    is_owner INTEGER NOT NULL DEFAULT 0,
+    added_at REAL
+);
 """
 
 
@@ -169,3 +175,44 @@ def mark_completed(identifier: str, torrent_name: str) -> None:
             "INSERT OR REPLACE INTO completed (identifier, torrent_name, finished_at) VALUES (?, ?, ?)",
             (identifier, torrent_name, time.time()),
         )
+
+
+# ------------------------------------------------------------------
+# allowed_users (برای claim خودکار اولین کاربر + مدیریت دستی بقیه)
+# ------------------------------------------------------------------
+
+def add_allowed_user(user_id: int, is_owner: bool = False) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO allowed_users (user_id, is_owner, added_at) VALUES (?, ?, ?)",
+            (user_id, int(is_owner), time.time()),
+        )
+
+
+def remove_allowed_user(user_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+
+
+def is_user_allowed(user_id: int) -> bool:
+    with _connect() as conn:
+        row = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,)).fetchone()
+    return row is not None
+
+
+def count_allowed_users() -> int:
+    with _connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM allowed_users").fetchone()
+    return row["c"]
+
+
+def list_allowed_users() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT user_id, is_owner FROM allowed_users ORDER BY added_at").fetchall()
+    return [{"user_id": r["user_id"], "is_owner": bool(r["is_owner"])} for r in rows]
+
+
+def is_user_owner(user_id: int) -> bool:
+    with _connect() as conn:
+        row = conn.execute("SELECT is_owner FROM allowed_users WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row["is_owner"])

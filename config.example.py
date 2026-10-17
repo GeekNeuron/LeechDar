@@ -38,7 +38,10 @@ def _env_id_set(key: str, default: set[int]) -> set[int]:
 
 # --- تلگرام: ربات ---
 TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN", "123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
-ALLOWED_USER_IDS = _env_id_set("ALLOWED_USER_IDS", {111111111})   # آیدی عددی از @userinfobot
+# خالی بذار (پیش‌فرض) تا اولین کسی که به ربات پیام بده خودکار «مالک»
+# بشه — نیازی نیست از قبل آیدی عددی خودت رو بدونی. اگه خودت از قبل
+# می‌خوای محدودش کنی، آیدی(ها) رو اینجا بذار (از @userinfobot بگیر).
+ALLOWED_USER_IDS = _env_id_set("ALLOWED_USER_IDS", set())
 
 # --- qBittorrent Web UI ---
 # روی سرور/داکر معمولاً QB_HOST میشه اسم سرویس qBittorrent تو
